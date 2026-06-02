@@ -1,0 +1,8 @@
+torch~=2.6.0
+monai~=1.4.0
+numpy~=1.26.4
+pydicom~=2.3.1
+simpleitk~=2.2.1
+matplotlib~=3.6.3
+optuna~=3.1.0
+torchmetrics~=0.11.0
