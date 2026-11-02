@@ -8,8 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..blocks.dynunet_block import UnetOutBlock
-from ..blocks.mamba import MambaCell3D, BiDirectionalMamba
+from ..blocks.mamba import MambaCell3D, BiDirectionalMamba, resolve_styles
 from ..blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
+from ..norms.conditional_instance_norm import ConditionalInstanceNorm3d
 from monai.utils import ensure_tuple_rep, look_up_option, optional_import
 from ..blocks.patch_merging import PatchMerging, PatchMergingV2
 from monai.utils.deprecate_utils import deprecated_arg
@@ -33,19 +34,19 @@ class LocalFeatureExtraction(nn.Module):
     Employs two 3D residual blocks to capture short-range anatomical context and texture continuity.
     Y = IN(Conv3D(GELU(IN(Conv3D(X))))) + X
     """
-    def __init__(self, channels, kernel=3):
+    def __init__(self, channels, kernel=3, num_styles=2):
         super().__init__()
         pad = kernel // 2
-        self.conv = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=kernel, padding=pad),
-            nn.InstanceNorm3d(channels, affine=True),
-            nn.GELU(),
-            nn.Conv3d(channels, channels, kernel_size=kernel, padding=pad),
-        )
-        self.norm_out = nn.InstanceNorm3d(channels, affine=True)
+        self.conv1 = nn.Conv3d(channels, channels, kernel_size=kernel, padding=pad)
+        self.norm1 = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=channels)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv3d(channels, channels, kernel_size=kernel, padding=pad)
+        self.norm_out = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=channels)
 
-    def forward(self, x):
-        return self.norm_out(self.conv(x) + x)
+    def forward(self, x, modalities=None):
+        styles = resolve_styles(modalities, x.shape[0])
+        h = self.act(self.norm1(self.conv1(x), styles))
+        return self.norm_out(self.conv2(h) + x, styles)
 
 
 class CMHB(nn.Module):
@@ -58,29 +59,30 @@ class CMHB(nn.Module):
     2. Global Dependency Modeling: Bidirectional Mamba for long-range dependencies
     3. Feature fusion via learnable scaling parameter gamma
     """
-    def __init__(self, channels, state_dim=64, kernel=9, downsample=2):
+    def __init__(self, channels, state_dim=64, kernel=9, downsample=2, num_styles=2):
         super().__init__()
-        self.local_extract = LocalFeatureExtraction(channels)
-        self.mamba = BiDirectionalMamba(channels, hidden_ch=channels, state_dim=state_dim, kernel=kernel, downsample=downsample)
+        self.local_extract = LocalFeatureExtraction(channels, num_styles=num_styles)
+        self.mamba = BiDirectionalMamba(channels, hidden_ch=channels, state_dim=state_dim, kernel=kernel, downsample=downsample, num_styles=num_styles)
         self.gamma = nn.Parameter(torch.tensor(1e-2).repeat(1, channels, 1, 1, 1))
-        self.norm_out = nn.InstanceNorm3d(channels, affine=True)
+        self.norm_out = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=channels)
 
     def forward(self, x, modalities=None):
-        y = self.local_extract(x)
-        m = self.mamba(y, modalities=modalities)
-        return self.norm_out(x + self.gamma * m)
+        styles = resolve_styles(modalities, x.shape[0])
+        y = self.local_extract(x, styles)
+        m = self.mamba(y, modalities=styles)
+        return self.norm_out(x + self.gamma * m, styles)
 
 
 class PatchEmbed3D(nn.Module):
     """3D patch embedding via stride convolution."""
-    def __init__(self, in_ch, embed_dim, patch_size=2):
+    def __init__(self, in_ch, embed_dim, patch_size=2, num_styles=2):
         super().__init__()
         self.proj = nn.Conv3d(in_ch, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.norm = nn.InstanceNorm3d(embed_dim, affine=True)
+        self.norm = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=embed_dim)
 
-    def forward(self, x):
+    def forward(self, x, modalities=None):
         x = self.proj(x)
-        x = self.norm(x)
+        x = self.norm(x, resolve_styles(modalities, x.shape[0]))
         return F.gelu(x)
 
 
@@ -90,46 +92,47 @@ class CMHBEncoder(nn.Module):
     Produces feature list: [feat1, feat2, feat3, feat4, feat5]
     Channels: embed, 2*embed, 4*embed, 8*embed, 16*embed
     """
-    def __init__(self, in_chans=1, embed_dim=24, depths=(2,2,2,2), patch_size=2, state_dim=64):
+    def __init__(self, in_chans=1, embed_dim=24, depths=(2,2,2,2), patch_size=2, state_dim=64, num_styles=2):
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
         self.depths = depths
 
-        self.patch1 = PatchEmbed3D(in_chans, embed_dim, patch_size=patch_size)
-        self.stage1 = nn.ModuleList([CMHB(embed_dim, state_dim=state_dim) for _ in range(depths[0])])
+        self.patch1 = PatchEmbed3D(in_chans, embed_dim, patch_size=patch_size, num_styles=num_styles)
+        self.stage1 = nn.ModuleList([CMHB(embed_dim, state_dim=state_dim, num_styles=num_styles) for _ in range(depths[0])])
 
         self.down2 = nn.Conv3d(embed_dim, embed_dim*2, kernel_size=2, stride=2)
-        self.norm2 = nn.InstanceNorm3d(embed_dim*2, affine=True)
-        self.stage2 = nn.ModuleList([CMHB(embed_dim*2, state_dim=state_dim) for _ in range(depths[1])])
+        self.norm2 = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=embed_dim*2)
+        self.stage2 = nn.ModuleList([CMHB(embed_dim*2, state_dim=state_dim, num_styles=num_styles) for _ in range(depths[1])])
 
         self.down3 = nn.Conv3d(embed_dim*2, embed_dim*4, kernel_size=2, stride=2)
-        self.norm3 = nn.InstanceNorm3d(embed_dim*4, affine=True)
-        self.stage3 = nn.ModuleList([CMHB(embed_dim*4, state_dim=state_dim) for _ in range(depths[2])])
+        self.norm3 = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=embed_dim*4)
+        self.stage3 = nn.ModuleList([CMHB(embed_dim*4, state_dim=state_dim, num_styles=num_styles) for _ in range(depths[2])])
 
         self.down4 = nn.Conv3d(embed_dim*4, embed_dim*8, kernel_size=2, stride=2)
-        self.norm4 = nn.InstanceNorm3d(embed_dim*8, affine=True)
-        self.stage4 = nn.ModuleList([CMHB(embed_dim*8, state_dim=state_dim) for _ in range(depths[3])])
+        self.norm4 = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=embed_dim*8)
+        self.stage4 = nn.ModuleList([CMHB(embed_dim*8, state_dim=state_dim, num_styles=num_styles) for _ in range(depths[3])])
 
         self.down5 = nn.Conv3d(embed_dim*8, embed_dim*16, kernel_size=2, stride=2)
-        self.norm5 = nn.InstanceNorm3d(embed_dim*16, affine=True)
-        self.stage5 = CMHB(embed_dim*16, state_dim=state_dim)
+        self.norm5 = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=embed_dim*16)
+        self.stage5 = CMHB(embed_dim*16, state_dim=state_dim, num_styles=num_styles)
 
     def forward(self, x, normalize=True, modalities=None):
-        feat1 = self.patch1(x)
+        styles = resolve_styles(modalities, x.shape[0])
+        feat1 = self.patch1(x, styles)
         for blk in self.stage1:
-            feat1 = blk(feat1, modalities)
-        feat2 = self.down2(feat1); feat2 = self.norm2(feat2)
+            feat1 = blk(feat1, styles)
+        feat2 = self.down2(feat1); feat2 = self.norm2(feat2, styles)
         for blk in self.stage2:
-            feat2 = blk(feat2, modalities)
-        feat3 = self.down3(feat2); feat3 = self.norm3(feat3)
+            feat2 = blk(feat2, styles)
+        feat3 = self.down3(feat2); feat3 = self.norm3(feat3, styles)
         for blk in self.stage3:
-            feat3 = blk(feat3, modalities)
-        feat4 = self.down4(feat3); feat4 = self.norm4(feat4)
+            feat3 = blk(feat3, styles)
+        feat4 = self.down4(feat3); feat4 = self.norm4(feat4, styles)
         for blk in self.stage4:
-            feat4 = blk(feat4, modalities)
-        feat5 = self.down5(feat4); feat5 = self.norm5(feat5)
-        feat5 = self.stage5(feat5, modalities)
+            feat4 = blk(feat4, styles)
+        feat5 = self.down5(feat4); feat5 = self.norm5(feat5, styles)
+        feat5 = self.stage5(feat5, styles)
         return [feat1, feat2, feat3, feat4, feat5]
 
 
@@ -176,20 +179,21 @@ class AMSF(nn.Module):
     3. Decoder refinement: CRA module for efficient attention
     4. Adaptive gating: Gated fusion of refined features
     """
-    def __init__(self, dec_ch, skip_ch, mid_ch=None, state_dim=64, downsample=2):
+    def __init__(self, dec_ch, skip_ch, mid_ch=None, state_dim=64, downsample=2, num_styles=2):
         super().__init__()
         if mid_ch is None:
             mid_ch = skip_ch
         self.dec_proj = nn.Conv3d(dec_ch, mid_ch, kernel_size=1)
         self.skip_proj = nn.Conv3d(skip_ch, mid_ch, kernel_size=1)
-        self.mamba = MambaCell3D(mid_ch, hidden_ch=mid_ch, state_dim=state_dim, downsample=downsample)
+        self.mamba = MambaCell3D(mid_ch, hidden_ch=mid_ch, state_dim=state_dim, downsample=downsample, num_styles=num_styles)
         self.cra = CRA(mid_ch)
         self.gate_mamba = nn.Conv3d(mid_ch, mid_ch, kernel_size=1)
         self.gate_cra = nn.Conv3d(mid_ch, mid_ch, kernel_size=1)
         self.out = nn.Conv3d(mid_ch, skip_ch, kernel_size=1)
-        self.norm = nn.InstanceNorm3d(skip_ch, affine=True)
+        self.norm = ConditionalInstanceNorm3d(num_styles=num_styles, num_features=skip_ch)
 
     def forward(self, dec_feat, enc_feat, modalities=None):
+        styles = resolve_styles(modalities, dec_feat.shape[0])
         B, _, Dd, Hd, Wd = dec_feat.shape
         _, _, De, He, We = enc_feat.shape
         dec_p = self.dec_proj(dec_feat)
@@ -202,7 +206,7 @@ class AMSF(nn.Module):
                 enc_resized = F.interpolate(enc_p, size=mid_size, mode='trilinear', align_corners=False)
         else:
             enc_resized = enc_p
-        enc_m = self.mamba(enc_resized, target_size=mid_size, modalities=modalities)
+        enc_m = self.mamba(enc_resized, target_size=mid_size, modalities=styles)
         dec_h = self.cra(dec_p)
         Gm = torch.sigmoid(self.gate_mamba(enc_m))
         Gh = torch.sigmoid(self.gate_cra(dec_h))
@@ -215,7 +219,7 @@ class AMSF(nn.Module):
                 fused_back = F.interpolate(fused_proj, size=(De, He, We), mode='trilinear', align_corners=False)
         else:
             fused_back = fused_proj
-        return self.norm(fused_back + enc_feat)
+        return self.norm(fused_back + enc_feat, styles)
 
 
 class MEUNETR(nn.Module):
@@ -261,6 +265,7 @@ class MEUNETR(nn.Module):
         use_v2: bool = False,
         mm_state_dim: int = 64,
         mm_kernel: int = 9,
+        num_styles: int = 2,
     ) -> None:
         super().__init__()
 
@@ -297,7 +302,7 @@ class MEUNETR(nn.Module):
 
         self.normalize = normalize
 
-        self.encoder = CMHBEncoder(in_chans=in_channels, embed_dim=feature_size, depths=depths, patch_size=patch_size, state_dim=mm_state_dim)
+        self.encoder = CMHBEncoder(in_chans=in_channels, embed_dim=feature_size, depths=depths, patch_size=patch_size, state_dim=mm_state_dim, num_styles=num_styles)
 
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
@@ -372,13 +377,13 @@ class MEUNETR(nn.Module):
         )
 
         fs = feature_size
-        self.amsf_hs3 = AMSF(dec_ch=16*fs, skip_ch=8*fs, mid_ch=8*fs, state_dim=mm_state_dim, downsample=2)
-        self.amsf_enc3 = AMSF(dec_ch=8*fs, skip_ch=4*fs, mid_ch=4*fs, state_dim=mm_state_dim, downsample=2)
-        self.amsf_enc2 = AMSF(dec_ch=4*fs, skip_ch=2*fs, mid_ch=2*fs, state_dim=mm_state_dim, downsample=2)
-        self.amsf_enc1 = AMSF(dec_ch=2*fs, skip_ch=1*fs, mid_ch=1*fs, state_dim=mm_state_dim, downsample=1)
-        self.amsf_enc0 = AMSF(dec_ch=1*fs, skip_ch=1*fs, mid_ch=1*fs, state_dim=mm_state_dim, downsample=1)
+        self.amsf_hs3 = AMSF(dec_ch=16*fs, skip_ch=8*fs, mid_ch=8*fs, state_dim=mm_state_dim, downsample=2, num_styles=num_styles)
+        self.amsf_enc3 = AMSF(dec_ch=8*fs, skip_ch=4*fs, mid_ch=4*fs, state_dim=mm_state_dim, downsample=2, num_styles=num_styles)
+        self.amsf_enc2 = AMSF(dec_ch=4*fs, skip_ch=2*fs, mid_ch=2*fs, state_dim=mm_state_dim, downsample=2, num_styles=num_styles)
+        self.amsf_enc1 = AMSF(dec_ch=2*fs, skip_ch=1*fs, mid_ch=1*fs, state_dim=mm_state_dim, downsample=1, num_styles=num_styles)
+        self.amsf_enc0 = AMSF(dec_ch=1*fs, skip_ch=1*fs, mid_ch=1*fs, state_dim=mm_state_dim, downsample=1, num_styles=num_styles)
 
-        self.bottleneck = BiDirectionalMamba(in_ch=16 * feature_size, hidden_ch=16*feature_size, state_dim=mm_state_dim, downsample=2)
+        self.bottleneck = BiDirectionalMamba(in_ch=16 * feature_size, hidden_ch=16*feature_size, state_dim=mm_state_dim, downsample=2, num_styles=num_styles)
 
         self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels)
 
@@ -394,6 +399,7 @@ class MEUNETR(nn.Module):
     def from_cfg(cls, cfg):
         mm_state_dim = getattr(cfg, "mm_state_dim", 64)
         mm_kernel = getattr(cfg, "mm_kernel", 9)
+        num_styles = getattr(cfg, "num_styles", 2)
         return cls(
             img_size=(cfg.roi_x, cfg.roi_y, cfg.roi_z),
             in_channels=cfg.in_channels,
@@ -420,6 +426,7 @@ class MEUNETR(nn.Module):
             use_v2=getattr(cfg, "use_v2", False),
             mm_state_dim=mm_state_dim,
             mm_kernel=mm_kernel,
+            num_styles=num_styles,
         )
 
     def load_from(self, weights):
