@@ -1,7 +1,6 @@
 from __future__ import annotations
 from collections.abc import Sequence
 
-import math
 import warnings
 import numpy as np
 import torch
@@ -9,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..blocks.dynunet_block import UnetOutBlock
+from ..blocks.mamba import MambaCell3D, BiDirectionalMamba
 from ..blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
 from monai.utils import ensure_tuple_rep, look_up_option, optional_import
 from ..blocks.patch_merging import PatchMerging, PatchMergingV2
@@ -25,128 +25,6 @@ __all__ = [
 ]
 
 MERGING_MODE = {"merging": PatchMerging, "mergingv2": PatchMergingV2}
-
-
-class MambaSSM(nn.Module):
-    """
-    Mamba State Space Model (SSM) for sequence modeling.
-    Implements selective state-space modeling with linear-time complexity.
-    Operates on [B, N, C] sequences and returns [B, N, C].
-    """
-    def __init__(self, channels, state_dim=64, kernel=9, dropout=0.0, residual_scale=0.1):
-        super().__init__()
-        self.C = channels
-        self.state_dim = state_dim
-        self.kernel = kernel
-        self.residual_scale = residual_scale
-
-        self.norm = nn.LayerNorm(channels)
-
-        self.to_state = nn.Linear(channels, state_dim)
-        padding = (kernel - 1) // 2
-        self.dw = nn.Conv1d(state_dim, state_dim, kernel_size=kernel, padding=padding, groups=state_dim)
-        self.to_chan = nn.Linear(state_dim, channels)
-
-        self.gate = nn.Linear(channels, channels)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        nn.init.zeros_(self.to_chan.weight)
-        nn.init.zeros_(self.to_chan.bias)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.constant_(self.gate.bias, 0.0)
-
-    def forward(self, seq):
-        B, N, C = seq.shape
-        x = self.norm(seq)
-        s = self.to_state(x)
-        s_t = s.permute(0, 2, 1)
-        s_t = self.dw(s_t)
-        s = s_t.permute(0, 2, 1)
-        s = self.to_chan(s)
-        s = self.act(s)
-        s = self.dropout(s)
-        g = torch.sigmoid(self.gate(x))
-        out = g * s + (1 - g) * x
-        return seq + self.residual_scale * out
-
-
-class MambaCell3D(nn.Module):
-    """
-    Apply MambaSSM to flattened 3D tokens with optional adaptive pooling.
-    Input: x [B, C, D, H, W] -> project -> pool -> flatten -> MambaSSM -> reshape -> project -> upsample back
-    """
-    def __init__(self, in_ch, hidden_ch=None, state_dim=64, kernel=9, downsample=2):
-        super().__init__()
-        self.in_ch = in_ch
-        self.hidden_ch = hidden_ch if hidden_ch is not None else in_ch
-        self.state_dim = state_dim
-        self.downsample = downsample
-
-        self.proj_in = nn.Conv3d(in_ch, self.hidden_ch, kernel_size=1)
-        self.proj_out = nn.Conv3d(self.hidden_ch, in_ch, kernel_size=1)
-        self.pos = nn.Parameter(torch.zeros(1, self.hidden_ch, 1, 1, 1))
-        self.ssm = MambaSSM(self.hidden_ch, state_dim=state_dim, kernel=kernel)
-        self.gate1 = nn.Conv1d(self.hidden_ch, self.hidden_ch, kernel_size=3, padding=1)
-
-    def _compute_target(self, D, H, W):
-        if isinstance(self.downsample, int) and self.downsample > 1:
-            Dt = max(1, math.ceil(D / self.downsample))
-            Ht = max(1, math.ceil(H / self.downsample))
-            Wt = max(1, math.ceil(W / self.downsample))
-            return (Dt, Ht, Wt)
-        return (D, H, W)
-
-    def forward(self, x, target_size=None):
-        B, C, D, H, W = x.shape
-        if target_size is None:
-            Dt, Ht, Wt = self._compute_target(D, H, W)
-        else:
-            Dt, Ht, Wt = target_size
-
-        if (Dt, Ht, Wt) != (D, H, W):
-            x_ds = F.adaptive_avg_pool3d(x, output_size=(Dt, Ht, Wt))
-        else:
-            x_ds = x
-
-        z = self.proj_in(x_ds)
-        z = z + self.pos
-        B2, Hc, Dp, Hp, Wp = z.shape
-        seq = z.reshape(B2, Hc, Dp * Hp * Wp).permute(0, 2, 1)
-        s_out = self.ssm(seq)
-        g = torch.sigmoid(self.gate1(seq.permute(0, 2, 1))).permute(0, 2, 1)
-        s_out = s_out * g
-        s_out = s_out.permute(0, 2, 1).reshape(B2, Hc, Dp, Hp, Wp)
-        out = self.proj_out(s_out)
-        if (Dt, Ht, Wt) != (D, H, W):
-            out = F.interpolate(out, size=(D, H, W), mode='trilinear', align_corners=False)
-        return out
-
-
-class BiDirectionalMamba(nn.Module):
-    """
-    Bidirectional scanning strategy to eliminate directional bias of causal SSMs in 3D imaging.
-    Processes sequence in both forward and reverse directions, fusing outputs for isotropic receptive fields.
-    O_bi = 0.5 * (O_uni^fwd + Flip(O_uni^bwd))
-    """
-    def __init__(self, in_ch, hidden_ch=None, state_dim=64, kernel=9, downsample=2):
-        super().__init__()
-        if hidden_ch is None:
-            hidden_ch = in_ch
-        self.fwd = MambaCell3D(in_ch, hidden_ch, state_dim=state_dim, kernel=kernel, downsample=downsample)
-        self.rev = MambaCell3D(in_ch, hidden_ch, state_dim=state_dim, kernel=kernel, downsample=downsample)
-        self.proj = nn.Conv3d(in_ch, in_ch, kernel_size=1)
-        self.norm = nn.InstanceNorm3d(in_ch, affine=True)
-
-    def forward(self, x):
-        out_f = self.fwd(x)
-        x_rev = torch.flip(x, dims=[2, 3, 4])
-        out_r = self.rev(x_rev)
-        out_r = torch.flip(out_r, dims=[2, 3, 4])
-        out = 0.5 * (out_f + out_r)
-        out = self.proj(out)
-        out = self.norm(out + x)
-        return out
 
 
 class LocalFeatureExtraction(nn.Module):
@@ -187,9 +65,9 @@ class CMHB(nn.Module):
         self.gamma = nn.Parameter(torch.tensor(1e-2).repeat(1, channels, 1, 1, 1))
         self.norm_out = nn.InstanceNorm3d(channels, affine=True)
 
-    def forward(self, x):
+    def forward(self, x, modalities=None):
         y = self.local_extract(x)
-        m = self.mamba(y)
+        m = self.mamba(y, modalities=modalities)
         return self.norm_out(x + self.gamma * m)
 
 
@@ -240,18 +118,18 @@ class CMHBEncoder(nn.Module):
     def forward(self, x, normalize=True, modalities=None):
         feat1 = self.patch1(x)
         for blk in self.stage1:
-            feat1 = blk(feat1)
+            feat1 = blk(feat1, modalities)
         feat2 = self.down2(feat1); feat2 = self.norm2(feat2)
         for blk in self.stage2:
-            feat2 = blk(feat2)
+            feat2 = blk(feat2, modalities)
         feat3 = self.down3(feat2); feat3 = self.norm3(feat3)
         for blk in self.stage3:
-            feat3 = blk(feat3)
+            feat3 = blk(feat3, modalities)
         feat4 = self.down4(feat3); feat4 = self.norm4(feat4)
         for blk in self.stage4:
-            feat4 = blk(feat4)
+            feat4 = blk(feat4, modalities)
         feat5 = self.down5(feat4); feat5 = self.norm5(feat5)
-        feat5 = self.stage5(feat5)
+        feat5 = self.stage5(feat5, modalities)
         return [feat1, feat2, feat3, feat4, feat5]
 
 
@@ -311,7 +189,7 @@ class AMSF(nn.Module):
         self.out = nn.Conv3d(mid_ch, skip_ch, kernel_size=1)
         self.norm = nn.InstanceNorm3d(skip_ch, affine=True)
 
-    def forward(self, dec_feat, enc_feat):
+    def forward(self, dec_feat, enc_feat, modalities=None):
         B, _, Dd, Hd, Wd = dec_feat.shape
         _, _, De, He, We = enc_feat.shape
         dec_p = self.dec_proj(dec_feat)
@@ -324,7 +202,7 @@ class AMSF(nn.Module):
                 enc_resized = F.interpolate(enc_p, size=mid_size, mode='trilinear', align_corners=False)
         else:
             enc_resized = enc_p
-        enc_m = self.mamba(enc_resized, target_size=mid_size)
+        enc_m = self.mamba(enc_resized, target_size=mid_size, modalities=modalities)
         dec_h = self.cra(dec_p)
         Gm = torch.sigmoid(self.gate_mamba(enc_m))
         Gh = torch.sigmoid(self.gate_cra(dec_h))
@@ -580,23 +458,23 @@ class MEUNETR(nn.Module):
         enc2 = self.encoder3(hidden_states_out[1], modalities)
         enc3 = self.encoder4(hidden_states_out[2], modalities)
 
-        dec4_feat = self.bottleneck(hidden_states_out[4])
+        dec4_feat = self.bottleneck(hidden_states_out[4], modalities)
         dec4 = self.encoder10(dec4_feat, modalities)
 
         hs3 = hidden_states_out[3]
-        fused_hs3 = self.amsf_hs3(dec4, hs3)
+        fused_hs3 = self.amsf_hs3(dec4, hs3, modalities)
         dec3 = self.decoder5(dec4, fused_hs3, modalities)
 
-        fused_enc3 = self.amsf_enc3(dec3, enc3)
+        fused_enc3 = self.amsf_enc3(dec3, enc3, modalities)
         dec2 = self.decoder4(dec3, fused_enc3, modalities)
 
-        fused_enc2 = self.amsf_enc2(dec2, enc2)
+        fused_enc2 = self.amsf_enc2(dec2, enc2, modalities)
         dec1 = self.decoder3(dec2, fused_enc2, modalities)
 
-        fused_enc1 = self.amsf_enc1(dec1, enc1)
+        fused_enc1 = self.amsf_enc1(dec1, enc1, modalities)
         dec0 = self.decoder2(dec1, fused_enc1, modalities)
 
-        fused_enc0 = self.amsf_enc0(dec0, enc0)
+        fused_enc0 = self.amsf_enc0(dec0, enc0, modalities)
         out = self.decoder1(dec0, fused_enc0, modalities)
 
         logits = self.out(out)
