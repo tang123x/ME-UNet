@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..blocks.dynunet_block import UnetOutBlock
-from ..blocks.mamba import MambaCell3D, BiDirectionalMamba, resolve_styles
+from ..blocks.mamba import resolve_styles, MambaCell3D, BiDirectionalMamba
 from ..blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
 from ..norms.conditional_instance_norm import ConditionalInstanceNorm3d
 from monai.utils import ensure_tuple_rep, look_up_option, optional_import
